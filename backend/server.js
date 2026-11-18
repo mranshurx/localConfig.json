@@ -599,7 +599,7 @@ const REASON_TEXT = {
   If you switch back to 'b64link', the body becomes base64( socks link )
   and encryption becomes available again — see SUB_ENCRYPT above.
 */
-const DEFAULT_NODE_AUTH = 'bacd383572e7f5092f950c96f489cb66:v1.498613.58db82a3.3f02b42d171737ed393861af';
+const DEFAULT_NODE_AUTH = 'dd185fb00109b75a09aa27396ed56eae:v1.498615.58db82a3.5ceff200cc23f53a03a4a6ce';
 const NODE_HOST = 'asiarezzx.toulouse-digital31.fr';
 const NODE_PORT = 8443;
 const PROFILE_NAME = 'PC5';
