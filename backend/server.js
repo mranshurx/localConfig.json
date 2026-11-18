@@ -650,8 +650,8 @@ const BASE_CONFIG = {
             port: 8443,
             users: [
               {
-                user: 'bacd383572e7f5092f950c96f489cb66',
-                pass: 'v1.498613.58db82a3.3f02b42d171737ed393861af'
+                user: 'dd185fb00109b75a09aa27396ed56eae',
+                pass: 'v1.498615.58db82a3.5ceff200cc23f53a03a4a6ce'
               }
             ]
           }
