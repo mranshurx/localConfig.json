@@ -27,7 +27,7 @@ const FALLBACK_PROVIDER_ID = 'ZGD3YGrW';
 /* ================= SUBSCRIPTION FORMAT ================= */
 /*
   'json'    — raw Xray JSON. The exact imported config, served verbatim.
-  'b64link' — base64( share link ). One clean server row, settings hidden.
+  'b64link' — base64( vless link ). One clean server row, settings hidden.
 
   JSON mode is the default now: the whole canonical profile (inbounds,
   routing table, outbound) reaches the client instead of a single
@@ -594,8 +594,8 @@ const REASON_TEXT = {
 /* ================= ROUTING CONFIG ================= */
 /*
   Upstream node is a VLESS URI held in the database and edited from the admin
-  panel. It is parsed into the proxy outbound on every request; the legacy
-  SOCKS5 upstream below stays as the fallback when no node is set.
+  panel. There is no second transport: the parsed node IS the proxy outbound,
+  and it is rebuilt on every request.
 
   /sub is delivered as raw Xray JSON (SUB_FORMAT = 'json'). The whole canonical
   profile — inbound, outbound, routing table — reaches Happ intact, so nothing
@@ -604,12 +604,9 @@ const REASON_TEXT = {
   With providerid + hide-settings the profile cannot be opened in the client,
   so the address, port, uuid and path never reach the user's eyes.
 
-  If you switch back to 'b64link', the body becomes base64( share link )
+  If you switch back to 'b64link', the body becomes base64( vless link )
   and encryption becomes available again — see SUB_ENCRYPT above.
 */
-const DEFAULT_NODE_AUTH = 'dd185fb00109b75a09aa27396ed56eae:v1.498615.58db82a3.5ceff200cc23f53a03a4a6ce';
-const NODE_HOST = 'asiarezzx.toulouse-digital31.fr';
-const NODE_PORT = 8443;
 const PROFILE_NAME = 'PC5';
 
 /* Node handed out when the admin box is empty. */
@@ -618,9 +615,8 @@ const DEFAULT_NODE_URI =
   '?encryption=none&security=tls&sni=keeping-chassis-points-adaptive.trycloudflare.com&fp=chrome' +
   '&type=ws&host=keeping-chassis-points-adaptive.trycloudflare.com&path=%2Fray#PC5-SERVER/INDIA';
 
-/* Auth handed to the node while the key is dead. The server rejects it, so the
+/* Uuid handed to the node while the key is dead. The node rejects it, so the
    handshake dies and the client reports a genuine failure instead of a fake ping. */
-const DEAD_AUTH = 'PC5-BLOCKED:0';
 const DEAD_UUID = '00000000-0000-0000-0000-000000000000';
 
 const PER_APP_LIST = 'com.garena.game.ffi,com.dts.freefiremax';
@@ -762,12 +758,10 @@ function nodeUriOf(db) {
 
 /* ================= BASE XRAY CONFIG (imported) ================= */
 /*
-  Canonical tunnel profile, kept verbatim from the exported config so the
-  routing table and inbound live in exactly one place.
-
-  buildConfig() deep-clones this and swaps only the proxy outbound. Nothing here
-  is ever mutated in place, so a blocked key, a feature auth or a node change
-  can never leak into the next response.
+  Canonical tunnel profile. The proxy outbound is the built-in VLESS node;
+  buildConfig() deep-clones this and swaps that outbound for the stored node.
+  Nothing here is ever mutated in place, so a blocked key or a node change can
+  never leak into the next response.
 */
 const BASE_CONFIG = {
   log: {
@@ -789,24 +783,7 @@ const BASE_CONFIG = {
     }
   ],
   outbounds: [
-    {
-      tag: 'proxy',
-      protocol: 'socks',
-      settings: {
-        servers: [
-          {
-            address: 'asiarezzx.toulouse-digital31.fr',
-            port: 8443,
-            users: [
-              {
-                user: 'dd185fb00109b75a09aa27396ed56eae',
-                pass: 'v1.498615.58db82a3.5ceff200cc23f53a03a4a6ce'
-              }
-            ]
-          }
-        ]
-      }
-    },
+    parseNode(DEFAULT_NODE_URI).outbound,
     {
       tag: 'direct',
       protocol: 'freedom',
@@ -842,85 +819,45 @@ const BASE_CONFIG = {
   }
 };
 
-/* Splits a user:pass credential, tolerating colons inside the password. */
-function splitAuth(cred) {
-  const i = cred.indexOf(':');
-  if (i < 0) return [cred, ''];
-  return [cred.slice(0, i), cred.slice(i + 1)];
-}
-
-/* Legacy SOCKS5 outbound — used only when the node URI cannot be parsed. */
-function socksOutbound(blocked, auth, host, port) {
-  const addr = host || NODE_HOST;
-  const prt = Number(port) || NODE_PORT;
-  const cred = blocked ? DEAD_AUTH : (auth || DEFAULT_NODE_AUTH);
-  const [user, pass] = splitAuth(cred);
-  return {
-    tag: 'proxy',
-    protocol: 'socks',
-    settings: {
-      servers: [{ address: addr, port: prt, users: [{ user, pass }] }]
-    }
-  };
-}
-
-/* Full Xray config — clones BASE_CONFIG, then swaps in the parsed node (or the
-   legacy SOCKS outbound when the URI is unreadable) and applies the label. */
-function buildConfig(blocked, label, auth, host, port, nodeUri) {
+/* Full Xray config — clones BASE_CONFIG, swaps in the parsed node and applies
+   the label. A dead key keeps the node but with an unknown uuid. */
+function buildConfig(blocked, label, nodeUri) {
   const outCfg = JSON.parse(JSON.stringify(BASE_CONFIG));
   outCfg.remarks = label;
 
   let parsed = parseNode(nodeUri || DEFAULT_NODE_URI);
   if (!parsed.ok) parsed = parseNode(DEFAULT_NODE_URI);
 
+  const ob = parsed.outbound;
+  if (blocked) ob.settings.vnext[0].users[0].id = DEAD_UUID;
+
   const idx = outCfg.outbounds.findIndex(o => o && o.tag === 'proxy');
+  if (idx >= 0) outCfg.outbounds[idx] = ob;
+  else outCfg.outbounds.unshift(ob);
 
-  if (parsed.ok) {
-    const ob = parsed.outbound;
-    /* A dead key gets a uuid the node does not know, so the handshake fails. */
-    if (blocked) ob.settings.vnext[0].users[0].id = DEAD_UUID;
-    if (idx >= 0) outCfg.outbounds[idx] = ob;
-    else outCfg.outbounds.unshift(ob);
-    return outCfg;
-  }
-
-  const legacy = socksOutbound(blocked, auth, host, port);
-  if (idx >= 0) outCfg.outbounds[idx] = legacy;
-  else outCfg.outbounds.unshift(legacy);
   return outCfg;
 }
 
-/* The same proxy outbound as a share link — used by 'b64link' mode.
-   VLESS nodes are re-emitted as a vless link; the legacy path keeps SOCKS. */
-function buildLink(blocked, label, auth, host, port, nodeUri) {
-  const uri = String(nodeUri || DEFAULT_NODE_URI).trim();
-
-  if (parseNode(uri).ok) {
-    const base = uri.split('#')[0];
-    const body = blocked ? base.replace(/^(vless:\/\/)[^@]+@/i, `$1${DEAD_UUID}@`) : base;
-    return `${body}#${encodeURIComponent(label)}`;
-  }
-
-  const addr = host || NODE_HOST;
-  const prt = Number(port) || NODE_PORT;
-  const cred = blocked ? DEAD_AUTH : (auth || DEFAULT_NODE_AUTH);
-  const b64 = Buffer.from(cred, 'utf8').toString('base64url');
-  return `socks://${b64}@${addr}:${prt}#${encodeURIComponent(label)}`;
+/* The same outbound as a share link — used by 'b64link' mode. */
+function buildLink(blocked, label, nodeUri) {
+  const base = String(nodeUri || DEFAULT_NODE_URI).trim().split('#')[0];
+  const body = blocked ? base.replace(/^(vless:\/\/)[^@]+@/i, `$1${DEAD_UUID}@`) : base;
+  return `${body}#${encodeURIComponent(label)}`;
 }
 
 /*
   Always emits a valid body — a blocked key gets a real outbound with a rejected
-  credential rather than an empty body, so the profile stays mounted and simply
-  fails to connect.
+  uuid rather than an empty body, so the profile stays mounted and simply fails
+  to connect.
 
   JSON mode returns the config object. b64link mode returns base64( link ).
   No comment lines: directives travel in the response headers instead, where
   they cannot corrupt the payload.
 */
-function subConfig(blocked, label, auth, host, port, nodeUri) {
-  const outCfg = buildConfig(blocked, label, auth, host, port, nodeUri);
+function subConfig(blocked, label, nodeUri) {
+  const outCfg = buildConfig(blocked, label, nodeUri);
   if (SUB_FORMAT === 'json') return JSON.stringify(outCfg, null, 2);
-  return Buffer.from(buildLink(blocked, label, auth, host, port, nodeUri), 'utf8').toString('base64');
+  return Buffer.from(buildLink(blocked, label, nodeUri), 'utf8').toString('base64');
 }
 
 /* AES-128-GCM. Happ wants the tag in its own header, base64'd — not appended
@@ -932,7 +869,11 @@ function encryptBody(text) {
 }
 
 /* ================= FEATURE MODES ================= */
-/* aimbot | location. Each mode may carry its own socks user:pass. */
+/*
+  aimbot | location. Both are label-only on a VLESS node, but the stored
+  user:pass strings are kept so the panel keeps its state and so they are still
+  there if a socks profile ever comes back.
+*/
 const FEATURE_MODES = ['aimbot', 'location'];
 const FEATURE_LABEL = { aimbot: 'AIMBOT', location: 'LOCATION + AIMBOT' };
 
@@ -943,13 +884,6 @@ function cleanAuth(v) {
   const [u, p] = s.split(':');
   if (!u.trim() || !p.trim()) return null;
   return s.slice(0, 160);
-}
-
-/* Auth for a mode. Empty string means "use the built-in default". */
-function authFor(db, mode) {
-  const f = (db && db.features) || {};
-  if (mode && FEATURE_MODES.includes(mode) && f[mode]) return f[mode];
-  return '';
 }
 
 /* ================= SUBSCRIPTION BODY ================= */
@@ -974,7 +908,7 @@ function happCacheSet(k, link) {
   }
   happLinkCache.set(k, { link, at: Date.now() });
 }
-/* Drop every cached link for a key so a mode/auth change is picked up at once. */
+/* Drop every cached link for a key so a mode/node change is picked up at once. */
 function happCacheDrop(key) {
   for (const k of [...happLinkCache.keys()]) {
     if (!key || k.startsWith(key + '|')) happLinkCache.delete(k);
@@ -1102,7 +1036,7 @@ app.get('/sub', async (req, res) => {
 
     if (m.enabled) {
       res.setHeader('x-pc5-status', 'maintenance');
-      body = subConfig(true, `${PROFILE_NAME} — MAINTENANCE`, '', null, null, node);
+      body = subConfig(true, `${PROFILE_NAME} — MAINTENANCE`, node);
     } else {
       /* k = license. Bare `key` is either the AES key id or a legacy link. */
       const legacy = String(req.query.key || '');
@@ -1111,7 +1045,7 @@ app.get('/sub', async (req, res) => {
       const out = key ? await accessKey(key, c, did, deviceUa(req)) : { ok: false, reason: 'invalid' };
       if (!out.ok) {
         res.setHeader('x-pc5-status', out.reason);
-        body = subConfig(true, `${PROFILE_NAME} — ${(REASON_TEXT[out.reason] || 'SUBSCRIPTION EXPIRED').toUpperCase()}`, '', null, null, node);
+        body = subConfig(true, `${PROFILE_NAME} — ${(REASON_TEXT[out.reason] || 'SUBSCRIPTION EXPIRED').toUpperCase()}`, node);
       } else {
         /* Advertised expiry uses the paused clock so the date does not creep
            forward in the client while the service is down. */
@@ -1120,7 +1054,7 @@ app.get('/sub', async (req, res) => {
         res.setHeader('x-pc5-status', 'ok');
         if (mode) res.setHeader('x-pc5-mode', mode);
         res.setHeader('subscription-userinfo', `upload=0; download=0; total=107374182400; expire=${Math.floor(liveExpiry / 1000)}`);
-        body = subConfig(false, PROFILE_NAME + tag, authFor(db, mode), null, null, node);
+        body = subConfig(false, PROFILE_NAME + tag, node);
       }
     }
   } catch (e) {
@@ -1262,7 +1196,7 @@ app.post('/api/admin/node', async (req, res) => {
 
     const effective = nodeUriOf({ node });
     const info = nodeInfoOf(effective);
-    console.log(`[node] -> ${info.ok ? `${info.host}:${info.port} ${info.proto}/${info.network}` : 'unreadable, using socks fallback'}${raw ? '' : ' (built-in default)'}`);
+    console.log(`[node] -> ${info.ok ? `${info.host}:${info.port} ${info.proto}/${info.network}` : 'unreadable, using default'}${raw ? '' : ' (built-in default)'}`);
     return res.json({ success: true, node, nodeInfo: { ...info, source: raw ? 'saved' : 'default' } });
   } catch (e) {
     return res.status(500).json({ error: 'Write failed: ' + e.message });
@@ -1274,7 +1208,7 @@ app.post('/api/admin/diag', async (req, res) => {
   if (!state) return;
 
   const c = credsFrom(req);
-  const nodeInfo = nodeInfoOf(nodeUriOf(null));
+  const nodeInfo = nodeInfoOf(DEFAULT_NODE_URI);
   const info = {
     storage: 'github',
     owner: c.owner,
@@ -1426,7 +1360,7 @@ app.post('/api/admin/list-keys', async (req, res) => {
   }
 });
 
-/* Saves the socks user:pass used for each feature mode. */
+/* Saves the user:pass strings used by each feature mode. */
 app.post('/api/admin/feature-auth', async (req, res) => {
   const state = await requireAdmin(req, res);
   if (!state) return;
@@ -1590,7 +1524,7 @@ app.post('/api/admin/maintenance', async (req, res) => {
       return db.maintenance;
     });
 
-    /* Cached Happ links embed the dead auth, so drop them on every toggle. */
+    /* Cached Happ links embed the dead uuid, so drop them on every toggle. */
     happLinkCache.clear();
     return res.json({ success: true, maintenance: m });
   } catch (e) {
@@ -1622,7 +1556,6 @@ const PORT = process.env.PORT || 3000;
     console.log(`[admin] key source -> ${ADMIN_KEY_URL}`);
     const ni = nodeInfoOf(DEFAULT_NODE_URI);
     console.log(`[node] default -> ${ni.ok ? `${ni.host}:${ni.port} ${ni.proto}/${ni.network}` : 'unreadable'}`);
-    console.log(`[node] socks fallback -> ${NODE_HOST}:${NODE_PORT}`);
     console.log(`[sub] format -> ${SUB_FORMAT} | providerid -> ${providerId()}`);
     console.log(`[sub] encrypt -> ${SUB_ENCRYPT ? `on (key id ${SUB_KEY_ID})` : 'off (json mode)'}`);
     getAdminKey(true);
