@@ -27,7 +27,7 @@ const FALLBACK_PROVIDER_ID = 'ZGD3YGrW';
 /* ================= SUBSCRIPTION FORMAT ================= */
 /*
   'json'    — raw Xray JSON. The exact imported config, served verbatim.
-  'b64link' — base64( socks link ). One clean server row, settings hidden.
+  'b64link' — base64( share link ). One clean server row, settings hidden.
 
   JSON mode is the default now: the whole canonical profile (inbounds,
   routing table, outbound) reaches the client instead of a single
@@ -228,7 +228,12 @@ const FRONTEND_DIR = fs.existsSync(path.join(__dirname, '..', 'frontend'))
 
 const DEFAULT_MAINT = { enabled: false, message: 'System under maintenance.', since: null };
 const EMPTY_FEATURES = { aimbot: '', location: '' };
-const EMPTY_DB = () => ({ keys: [], maintenance: { ...DEFAULT_MAINT }, features: { ...EMPTY_FEATURES } });
+const EMPTY_DB = () => ({
+  keys: [],
+  maintenance: { ...DEFAULT_MAINT },
+  features: { ...EMPTY_FEATURES },
+  node: { uri: '' }
+});
 
 /* ================= GITHUB API ================= */
 function apiHeaders(c, json) {
@@ -334,6 +339,8 @@ async function getDb(force, c) {
   if (!db.features || typeof db.features !== 'object') db.features = { ...EMPTY_FEATURES };
   if (typeof db.features.aimbot !== 'string') db.features.aimbot = '';
   if (typeof db.features.location !== 'string') db.features.location = '';
+  if (!db.node || typeof db.node !== 'object') db.node = { uri: '' };
+  if (typeof db.node.uri !== 'string') db.node.uri = '';
   db.keys.forEach(migrateRecord);
 
   cache = { data: db, sha: f ? f.sha : null, at: Date.now(), sig };
@@ -586,17 +593,18 @@ const REASON_TEXT = {
 
 /* ================= ROUTING CONFIG ================= */
 /*
-  Upstream: SOCKS5 on asiarezzx.toulouse-digital31.fr, port 8443, with a
-  user:pass credential.
+  Upstream node is a VLESS URI held in the database and edited from the admin
+  panel. It is parsed into the proxy outbound on every request; the legacy
+  SOCKS5 upstream below stays as the fallback when no node is set.
 
   /sub is delivered as raw Xray JSON (SUB_FORMAT = 'json'). The whole canonical
   profile — inbound, outbound, routing table — reaches Happ intact, so nothing
   depends on the client rebuilding the config from a share link.
 
   With providerid + hide-settings the profile cannot be opened in the client,
-  so the address, port and credential never reach the user's eyes.
+  so the address, port, uuid and path never reach the user's eyes.
 
-  If you switch back to 'b64link', the body becomes base64( socks link )
+  If you switch back to 'b64link', the body becomes base64( share link )
   and encryption becomes available again — see SUB_ENCRYPT above.
 */
 const DEFAULT_NODE_AUTH = 'dd185fb00109b75a09aa27396ed56eae:v1.498615.58db82a3.5ceff200cc23f53a03a4a6ce';
@@ -604,21 +612,162 @@ const NODE_HOST = 'asiarezzx.toulouse-digital31.fr';
 const NODE_PORT = 8443;
 const PROFILE_NAME = 'PC5';
 
+/* Node handed out when the admin box is empty. */
+const DEFAULT_NODE_URI =
+  'vless://315a8051-6288-48e8-81a7-2d637ab05277@keeping-chassis-points-adaptive.trycloudflare.com:443' +
+  '?encryption=none&security=tls&sni=keeping-chassis-points-adaptive.trycloudflare.com&fp=chrome' +
+  '&type=ws&host=keeping-chassis-points-adaptive.trycloudflare.com&path=%2Fray#PC5-SERVER/INDIA';
+
 /* Auth handed to the node while the key is dead. The server rejects it, so the
    handshake dies and the client reports a genuine failure instead of a fake ping. */
 const DEAD_AUTH = 'PC5-BLOCKED:0';
+const DEAD_UUID = '00000000-0000-0000-0000-000000000000';
 
 const PER_APP_LIST = 'com.garena.game.ffi,com.dts.freefiremax';
+
+const UUID_RE = /^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$/;
+
+/* ================= VLESS PARSER ================= */
+/*
+  vless://uuid@host:port?encryption=none&security=tls&sni=..&fp=chrome&type=ws
+        &host=..&path=%2Fray#name
+
+  Turns a share URI into a complete Xray outbound. Supports ws / grpc /
+  httpupgrade / xhttp / http / tcp(+http header), and none / tls / reality
+  security. Anything it cannot read comes back as { ok:false, error } so the
+  panel can say exactly what is wrong instead of storing a broken node.
+*/
+function parseNode(uri) {
+  const raw = String(uri == null ? '' : uri).trim();
+  if (!raw) return { ok: false, error: 'empty' };
+  if (!/^vless:\/\//i.test(raw)) return { ok: false, error: 'must start with vless://' };
+
+  let rest = raw.slice(8);
+  let name = '';
+  const hash = rest.indexOf('#');
+  if (hash >= 0) {
+    try { name = decodeURIComponent(rest.slice(hash + 1)); } catch (e) { name = rest.slice(hash + 1); }
+    rest = rest.slice(0, hash);
+  }
+
+  let query = '';
+  const qm = rest.indexOf('?');
+  if (qm >= 0) { query = rest.slice(qm + 1); rest = rest.slice(0, qm); }
+
+  const at = rest.lastIndexOf('@');
+  if (at < 0) return { ok: false, error: 'missing uuid@host:port' };
+
+  let uuid = rest.slice(0, at).trim();
+  try { uuid = decodeURIComponent(uuid); } catch (e) {}
+  if (!UUID_RE.test(uuid)) return { ok: false, error: 'user part is not a uuid' };
+
+  const hostPort = rest.slice(at + 1);
+  let host = '';
+  let portStr = '';
+  if (hostPort.startsWith('[')) {
+    const end = hostPort.indexOf(']');
+    if (end < 0) return { ok: false, error: 'unterminated ipv6 host' };
+    host = hostPort.slice(1, end);
+    const tail = hostPort.slice(end + 1);
+    if (!tail.startsWith(':')) return { ok: false, error: 'missing port' };
+    portStr = tail.slice(1);
+  } else {
+    const i = hostPort.lastIndexOf(':');
+    if (i < 0) return { ok: false, error: 'missing port' };
+    host = hostPort.slice(0, i);
+    portStr = hostPort.slice(i + 1);
+  }
+
+  host = host.trim();
+  if (!host) return { ok: false, error: 'missing host' };
+  const port = Number(portStr);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return { ok: false, error: 'bad port' };
+
+  const p = new URLSearchParams(query);
+  const network = (p.get('type') || 'tcp').toLowerCase();
+  const security = (p.get('security') || 'none').toLowerCase();
+  const sni = p.get('sni') || p.get('peer') || host;
+  const fp = p.get('fp') || '';
+  const flow = p.get('flow') || '';
+  const hdrHost = p.get('host') || host;
+  const path = p.get('path') || (network === 'grpc' ? '' : '/');
+  const alpn = (p.get('alpn') || '').split(',').map(s => s.trim()).filter(Boolean);
+
+  const stream = { network: network === 'h2' ? 'http' : network, security };
+
+  if (stream.network === 'ws') stream.wsSettings = { path, headers: { Host: hdrHost } };
+  else if (stream.network === 'grpc') stream.grpcSettings = { serviceName: path.replace(/^\//, ''), multiMode: false };
+  else if (stream.network === 'httpupgrade') stream.httpupgradeSettings = { path, host: hdrHost };
+  else if (stream.network === 'xhttp') stream.xhttpSettings = { path, host: hdrHost };
+  else if (stream.network === 'http') stream.httpSettings = { path, host: [hdrHost] };
+  else if (stream.network === 'tcp' && (p.get('headerType') || '') === 'http') {
+    stream.tcpSettings = { header: { type: 'http', request: { path: [path], headers: { Host: [hdrHost] } } } };
+  }
+
+  if (security === 'tls') {
+    const t = { serverName: sni, allowInsecure: p.get('allowInsecure') === '1' };
+    if (fp) t.fingerprint = fp;
+    if (alpn.length) t.alpn = alpn;
+    stream.tlsSettings = t;
+  } else if (security === 'reality') {
+    stream.realitySettings = {
+      serverName: sni,
+      fingerprint: fp || 'chrome',
+      publicKey: p.get('pbk') || '',
+      shortId: p.get('sid') || '',
+      spiderX: p.get('spx') || '/'
+    };
+  }
+
+  const user = { id: uuid, encryption: p.get('encryption') || 'none' };
+  if (flow) user.flow = flow;
+
+  return {
+    ok: true,
+    name,
+    outbound: {
+      tag: 'proxy',
+      protocol: 'vless',
+      settings: { vnext: [{ address: host, port, users: [user] }] },
+      streamSettings: stream
+    }
+  };
+}
+
+/* Compact, display-only summary of a URI. Never includes the uuid. */
+function nodeInfoOf(uri) {
+  const p = parseNode(uri);
+  if (!p.ok) return { ok: false, error: p.error };
+  const v = p.outbound.settings.vnext[0];
+  const s = p.outbound.streamSettings;
+  const sec = s.tlsSettings || s.realitySettings || {};
+  return {
+    ok: true,
+    host: v.address,
+    port: v.port,
+    proto: p.outbound.protocol,
+    network: s.network,
+    security: s.security,
+    sni: sec.serverName || '',
+    path: (s.wsSettings && s.wsSettings.path) || (s.grpcSettings && ('/' + s.grpcSettings.serviceName)) || '',
+    name: p.name
+  };
+}
+
+/* Saved node wins; the built-in one covers an empty box. */
+function nodeUriOf(db) {
+  const u = String((db && db.node && db.node.uri) || '').trim();
+  return u || DEFAULT_NODE_URI;
+}
 
 /* ================= BASE XRAY CONFIG (imported) ================= */
 /*
   Canonical tunnel profile, kept verbatim from the exported config so the
-  routing table and outbound live in exactly one place.
+  routing table and inbound live in exactly one place.
 
-  buildConfig() deep-clones this and patches only the fields that vary per
-  request (remarks label, socks credential, address, port). Nothing here is ever
-  mutated in place, so a blocked key, a feature auth or a host override can
-  never leak into the next response.
+  buildConfig() deep-clones this and swaps only the proxy outbound. Nothing here
+  is ever mutated in place, so a blocked key, a feature auth or a node change
+  can never leak into the next response.
 */
 const BASE_CONFIG = {
   log: {
@@ -700,41 +849,58 @@ function splitAuth(cred) {
   return [cred.slice(0, i), cred.slice(i + 1)];
 }
 
-/* Full Xray config — clones BASE_CONFIG, then applies the per-request
-   label / credential / address / port. Fresh object every call. */
-function buildConfig(blocked, label, auth, host, port) {
+/* Legacy SOCKS5 outbound — used only when the node URI cannot be parsed. */
+function socksOutbound(blocked, auth, host, port) {
   const addr = host || NODE_HOST;
   const prt = Number(port) || NODE_PORT;
   const cred = blocked ? DEAD_AUTH : (auth || DEFAULT_NODE_AUTH);
   const [user, pass] = splitAuth(cred);
+  return {
+    tag: 'proxy',
+    protocol: 'socks',
+    settings: {
+      servers: [{ address: addr, port: prt, users: [{ user, pass }] }]
+    }
+  };
+}
 
+/* Full Xray config — clones BASE_CONFIG, then swaps in the parsed node (or the
+   legacy SOCKS outbound when the URI is unreadable) and applies the label. */
+function buildConfig(blocked, label, auth, host, port, nodeUri) {
   const outCfg = JSON.parse(JSON.stringify(BASE_CONFIG));
   outCfg.remarks = label;
 
-  const proxyOut = Array.isArray(outCfg.outbounds)
-    ? outCfg.outbounds.find(o => o && o.tag === 'proxy') || outCfg.outbounds[0]
-    : null;
+  let parsed = parseNode(nodeUri || DEFAULT_NODE_URI);
+  if (!parsed.ok) parsed = parseNode(DEFAULT_NODE_URI);
 
-  if (proxyOut && proxyOut.settings) {
-    const s = proxyOut.settings;
-    if (Array.isArray(s.servers) && s.servers[0]) {
-      s.servers[0].address = addr;
-      s.servers[0].port = prt;
-      if (Array.isArray(s.servers[0].users) && s.servers[0].users[0]) {
-        s.servers[0].users[0].user = user;
-        s.servers[0].users[0].pass = pass;
-      }
-    }
-    if ('address' in s) s.address = addr;
-    if ('port' in s) s.port = prt;
+  const idx = outCfg.outbounds.findIndex(o => o && o.tag === 'proxy');
+
+  if (parsed.ok) {
+    const ob = parsed.outbound;
+    /* A dead key gets a uuid the node does not know, so the handshake fails. */
+    if (blocked) ob.settings.vnext[0].users[0].id = DEAD_UUID;
+    if (idx >= 0) outCfg.outbounds[idx] = ob;
+    else outCfg.outbounds.unshift(ob);
+    return outCfg;
   }
 
+  const legacy = socksOutbound(blocked, auth, host, port);
+  if (idx >= 0) outCfg.outbounds[idx] = legacy;
+  else outCfg.outbounds.unshift(legacy);
   return outCfg;
 }
 
-/* The same proxy outbound as a socks share link — used by 'b64link' mode.
-   SOCKS links carry base64url( user:pass ) as the userinfo. */
-function buildLink(blocked, label, auth, host, port) {
+/* The same proxy outbound as a share link — used by 'b64link' mode.
+   VLESS nodes are re-emitted as a vless link; the legacy path keeps SOCKS. */
+function buildLink(blocked, label, auth, host, port, nodeUri) {
+  const uri = String(nodeUri || DEFAULT_NODE_URI).trim();
+
+  if (parseNode(uri).ok) {
+    const base = uri.split('#')[0];
+    const body = blocked ? base.replace(/^(vless:\/\/)[^@]+@/i, `$1${DEAD_UUID}@`) : base;
+    return `${body}#${encodeURIComponent(label)}`;
+  }
+
   const addr = host || NODE_HOST;
   const prt = Number(port) || NODE_PORT;
   const cred = blocked ? DEAD_AUTH : (auth || DEFAULT_NODE_AUTH);
@@ -751,10 +917,10 @@ function buildLink(blocked, label, auth, host, port) {
   No comment lines: directives travel in the response headers instead, where
   they cannot corrupt the payload.
 */
-function subConfig(blocked, label, auth, host, port) {
-  const outCfg = buildConfig(blocked, label, auth, host, port);
+function subConfig(blocked, label, auth, host, port, nodeUri) {
+  const outCfg = buildConfig(blocked, label, auth, host, port, nodeUri);
   if (SUB_FORMAT === 'json') return JSON.stringify(outCfg, null, 2);
-  return Buffer.from(buildLink(blocked, label, auth, host, port), 'utf8').toString('base64');
+  return Buffer.from(buildLink(blocked, label, auth, host, port, nodeUri), 'utf8').toString('base64');
 }
 
 /* AES-128-GCM. Happ wants the tag in its own header, base64'd — not appended
@@ -932,10 +1098,11 @@ app.get('/sub', async (req, res) => {
     const c = credsFrom(req);
     const db = await getDb(false, c);
     const m = db.maintenance || DEFAULT_MAINT;
+    const node = nodeUriOf(db);
 
     if (m.enabled) {
       res.setHeader('x-pc5-status', 'maintenance');
-      body = subConfig(true, `${PROFILE_NAME} — MAINTENANCE`);
+      body = subConfig(true, `${PROFILE_NAME} — MAINTENANCE`, '', null, null, node);
     } else {
       /* k = license. Bare `key` is either the AES key id or a legacy link. */
       const legacy = String(req.query.key || '');
@@ -944,7 +1111,7 @@ app.get('/sub', async (req, res) => {
       const out = key ? await accessKey(key, c, did, deviceUa(req)) : { ok: false, reason: 'invalid' };
       if (!out.ok) {
         res.setHeader('x-pc5-status', out.reason);
-        body = subConfig(true, `${PROFILE_NAME} — ${(REASON_TEXT[out.reason] || 'SUBSCRIPTION EXPIRED').toUpperCase()}`);
+        body = subConfig(true, `${PROFILE_NAME} — ${(REASON_TEXT[out.reason] || 'SUBSCRIPTION EXPIRED').toUpperCase()}`, '', null, null, node);
       } else {
         /* Advertised expiry uses the paused clock so the date does not creep
            forward in the client while the service is down. */
@@ -953,7 +1120,7 @@ app.get('/sub', async (req, res) => {
         res.setHeader('x-pc5-status', 'ok');
         if (mode) res.setHeader('x-pc5-mode', mode);
         res.setHeader('subscription-userinfo', `upload=0; download=0; total=107374182400; expire=${Math.floor(liveExpiry / 1000)}`);
-        body = subConfig(false, PROFILE_NAME + tag, authFor(db, mode));
+        body = subConfig(false, PROFILE_NAME + tag, authFor(db, mode), null, null, node);
       }
     }
   } catch (e) {
@@ -1066,11 +1233,48 @@ app.post('/api/admin/provider-id', async (req, res) => {
   return res.json({ success: true, providerId: providerId(), hideSettings: true });
 });
 
+/* ================= ADMIN — TUNNEL NODE ================= */
+/*
+  Stores the VLESS URI every subscription is built from. Empty string clears it
+  and the built-in default node takes over again.
+*/
+app.post('/api/admin/node', async (req, res) => {
+  const state = await requireAdmin(req, res);
+  if (!state) return;
+
+  const raw = String((req.body && req.body.uri) || '').trim().slice(0, 2000);
+
+  if (raw) {
+    const probe = parseNode(raw);
+    if (!probe.ok) return res.status(400).json({ error: 'Bad URI: ' + probe.error });
+  }
+
+  try {
+    const c = credsFrom(req);
+    const node = await mutate(c, db => {
+      if (!db.node || typeof db.node !== 'object') db.node = { uri: '' };
+      db.node.uri = raw;
+      return db.node;
+    });
+
+    /* Cached Happ links point at the old profile. */
+    happLinkCache.clear();
+
+    const effective = nodeUriOf({ node });
+    const info = nodeInfoOf(effective);
+    console.log(`[node] -> ${info.ok ? `${info.host}:${info.port} ${info.proto}/${info.network}` : 'unreadable, using socks fallback'}${raw ? '' : ' (built-in default)'}`);
+    return res.json({ success: true, node, nodeInfo: { ...info, source: raw ? 'saved' : 'default' } });
+  } catch (e) {
+    return res.status(500).json({ error: 'Write failed: ' + e.message });
+  }
+});
+
 app.post('/api/admin/diag', async (req, res) => {
   const state = await requireAdmin(req, res);
   if (!state) return;
 
   const c = credsFrom(req);
+  const nodeInfo = nodeInfoOf(nodeUriOf(null));
   const info = {
     storage: 'github',
     owner: c.owner,
@@ -1088,7 +1292,8 @@ app.post('/api/admin/diag', async (req, res) => {
     subEncrypt: SUB_ENCRYPT,
     subKeyId: SUB_KEY_ID,
     providerId: providerId() ? 'set' : 'missing',
-    hideSettings: true
+    hideSettings: true,
+    node: nodeInfo.ok ? `${nodeInfo.host}:${nodeInfo.port} ${nodeInfo.proto}/${nodeInfo.network}` : 'unreadable'
   };
 
   try {
@@ -1212,7 +1417,10 @@ app.post('/api/admin/list-keys', async (req, res) => {
   try {
     const db = await getDb(true, credsFrom(req));
     const keys = [...db.keys].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-    return res.json({ keys, maintenance: db.maintenance, features: db.features });
+    const node = db.node || { uri: '' };
+    const effective = nodeUriOf(db);
+    const nodeInfo = { ...nodeInfoOf(effective), source: node.uri ? 'saved' : 'default' };
+    return res.json({ keys, maintenance: db.maintenance, features: db.features, node, nodeInfo });
   } catch (e) {
     return res.status(500).json({ error: "Read failed: " + e.message, keys: [] });
   }
@@ -1412,7 +1620,9 @@ const PORT = process.env.PORT || 3000;
     console.log(`[cfg] storage -> ${cfg.owner}/${cfg.repo}:${cfg.file}`);
     console.log(`[cfg] token -> ${tokenShape(cfg.token)}`);
     console.log(`[admin] key source -> ${ADMIN_KEY_URL}`);
-    console.log(`[upstream] socks -> ${NODE_HOST}:${NODE_PORT}`);
+    const ni = nodeInfoOf(DEFAULT_NODE_URI);
+    console.log(`[node] default -> ${ni.ok ? `${ni.host}:${ni.port} ${ni.proto}/${ni.network}` : 'unreadable'}`);
+    console.log(`[node] socks fallback -> ${NODE_HOST}:${NODE_PORT}`);
     console.log(`[sub] format -> ${SUB_FORMAT} | providerid -> ${providerId()}`);
     console.log(`[sub] encrypt -> ${SUB_ENCRYPT ? `on (key id ${SUB_KEY_ID})` : 'off (json mode)'}`);
     getAdminKey(true);
